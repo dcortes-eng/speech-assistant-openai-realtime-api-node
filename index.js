@@ -68,20 +68,21 @@ fastify.register(async (app) => {
     openaiWs.on('open', () => {
       console.log('OpenAI WS abierto');
 
-      const sessionUpdate = {
+      // ---- Configurar la sesión Realtime (OpenAI)
+const sessionUpdate = {
   type: 'session.update',
   session: {
+    // Prompt del sistema (tu persona y reglas)
     instructions: SYSTEM_PROMPT,
 
-    // Deja que el servidor cierre turnos automáticamente
+    // Cierre de turno automático del lado del servidor
     turn_detection: {
       type: 'server_vad',
-      // valores conservadores (puedes ajustar luego)
       prefix_padding_ms: 150,
       silence_duration_ms: 400,
     },
 
-    // ⚠️ Cambiamos a 'mulaw' (más compatible que 'g711_ulaw')
+    // ⚠️ Formatos compatibles con Twilio (8 kHz μ-law)
     input_audio_format:  { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
     output_audio_format: { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
 
@@ -90,42 +91,45 @@ fastify.register(async (app) => {
   },
 };
 
-      openaiWs.send(JSON.stringify(sessionUpdate));
-      openaiReady = true;
+// Enviar la actualización de sesión cuando el WS abra
+openaiWs.on('open', () => {
+  console.log('OpenAI WS abierto');
+  setTimeout(() => {
+    openaiWs.send(JSON.stringify(sessionUpdate));
+  }, 50);
+});
 
-      // (Opcional) haz que la IA salude primero:
-      // openaiWs.send(JSON.stringify({
-      //   type: 'response.create',
-      //   response: { instructions: 'Hola, soy tu asistente. ¿En qué te ayudo?' }
-      // }));
-    });
+   // ── Mensajes desde OpenAI → los reenviamos a Twilio
+openaiWs.on('message', (raw) => {
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
 
-    // ——— Mensajes desde OpenAI -> los reenviamos a Twilio
-    openaiWs.on('message', (raw) => {
-      let msg;
-      try { msg = JSON.parse(raw); } catch { return; }
+  // Log de error detallado (muy importante para depurar)
+  if (msg.type === 'error') {
+    console.error('[OpenAI ERROR]', JSON.stringify(msg, null, 2));
+    return;
+  }
 
-      // Para depurar:
-      if (msg.type && msg.type !== 'response.output_audio.delta') {
-        console.log('[OpenAI]', msg.type);
-      }
+  // Logea tipos (menos los deltas para no saturar)
+  if (msg.type && msg.type !== 'response.output_audio.delta') {
+    console.log('[OpenAI]', msg.type);
+  }
 
-      // Audio de salida (μ-law base64)
-      if (msg.type === 'response.output_audio.delta' && msg.delta && streamSid) {
-        twilioConn.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: msg.delta }   // base64 μ-law
-        }));
+  // Audio de salida (μ-law base64) → a Twilio Media Streams
+  if (msg.type === 'response.output_audio.delta' && msg.delta && streamSid) {
+    twilioConn.send(JSON.stringify({
+      event: 'media',
+      streamSid,
+      media: { payload: msg.delta }  // base64 μ-law
+    }));
+  }
 
-        // para cortar reproducción en el cliente Twilio entre trozos:
-        twilioConn.send(JSON.stringify({
-          event: 'mark',
-          streamSid,
-          mark: { name: 'chunk' }
-        }));
-      }
-    });
+  // (Opcional) fin de respuesta
+  if (msg.type === 'response.done') {
+    // Puedes marcar fin si usas marks
+    // twilioConn.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_end' } }));
+  }
+});
 
     openaiWs.on('error', (e) => {
       console.error('OpenAI WS error:', e?.message || e);
