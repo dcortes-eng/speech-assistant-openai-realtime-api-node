@@ -69,22 +69,26 @@ fastify.register(async (app) => {
       console.log('OpenAI WS abierto');
 
       const sessionUpdate = {
-        type: 'session.update',
-        session: {
-          // Realtime session
-          instructions: SYSTEM_PROMPT,
+  type: 'session.update',
+  session: {
+    instructions: SYSTEM_PROMPT,
 
-          // Turn detection: el servidor decide cuándo “cerrar” el turno del usuario
-          turn_detection: { type: 'server_vad' },
+    // Deja que el servidor cierre turnos automáticamente
+    turn_detection: {
+      type: 'server_vad',
+      // valores conservadores (puedes ajustar luego)
+      prefix_padding_ms: 150,
+      silence_duration_ms: 400,
+    },
 
-          // Formatos *correctos* para Twilio (G.711 μ-law 8kHz mono)
-          input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: 8000, channels: 1 },
-          output_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000, channels: 1 },
+    // ⚠️ Cambiamos a 'mulaw' (más compatible que 'g711_ulaw')
+    input_audio_format:  { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
+    output_audio_format: { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
 
-          // Voz de salida
-          voice: OPENAI_VOICE
-        },
-      };
+    // ⚠️ Voz segura universal
+    voice: 'alloy',
+  },
+};
 
       openaiWs.send(JSON.stringify(sessionUpdate));
       openaiReady = true;
