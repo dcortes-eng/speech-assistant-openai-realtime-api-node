@@ -1,4 +1,4 @@
-// index.js — Twilio <-> OpenAI Realtime (formato correcto G.711 u-law 8kHz)
+// index.js — Twilio <-> OpenAI Realtime (G.711 μ-law 8kHz)
 
 import Fastify from 'fastify';
 import WebSocket from 'ws';
@@ -8,12 +8,12 @@ import fastifyWs from '@fastify/websocket';
 
 dotenv.config();
 
-// === Variables de entorno (Render) ===
+/** ── Variables de entorno (Render) */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL   = process.env.OPENAI_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
-const OPENAI_VOICE   = process.env.OPENAI_VOICE || 'alloy';
+const OPENAI_MODEL   = process.env.OPENAI_MODEL   || 'gpt-4o-realtime-preview-2024-12-17';
+const OPENAI_VOICE   = process.env.OPENAI_VOICE   || 'alloy';
 const TEMPERATURE    = Number(process.env.OPENAI_TEMPERATURE || 0.7);
-const SYSTEM_PROMPT  = process.env.SYSTEM_PROMPT || 'Eres una asistente de voz útil.';
+const SYSTEM_PROMPT  = process.env.SYSTEM_PROMPT  || 'Eres una asistente de voz útil.';
 const PORT           = process.env.PORT || 5050;
 
 if (!OPENAI_API_KEY) {
@@ -25,15 +25,13 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// ————————————————————————————————————————————————————————————
-// Healthcheck
+/** Healthcheck */
 fastify.get('/', async (_req, reply) => {
   reply.send({ ok: true, service: 'Twilio <-> OpenAI Realtime', model: OPENAI_MODEL });
 });
 
-// — TwiML webhook (Twilio -> Render)
+/** TwiML (Twilio -> Render) */
 fastify.all('/incoming-call', async (request, reply) => {
-  // Nota: usa una voz neutra solo para el mensaje de enlace.
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
   <Response>
     <Say voice="Google.es-ES-Standard-A">Conectando con el asistente de voz. Puedes hablar después del tono.</Say>
@@ -42,94 +40,84 @@ fastify.all('/incoming-call', async (request, reply) => {
       <Stream url="wss://${request.headers.host}/media-stream"/>
     </Connect>
   </Response>`;
-
   reply.type('text/xml').send(twiml);
 });
 
-// — Canal WS para audio Twilio
+/** WebSocket para Twilio Media Streams */
 fastify.register(async (app) => {
-  app.get('/media-stream', { websocket: true }, (twilioConn, req) => {
+  app.get('/media-stream', { websocket: true }, (twilioConn, _req) => {
     console.log('Twilio conectado');
 
     let streamSid = null;
-    let openaiReady = false;    // hasta que abra el WS
-    let lastAssistantItem = null;
+    let openaiReady = false; // se pone true al enviar session.update
 
-    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}&temperature=${TEMPERATURE}`;
+    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
 
     const openaiWs = new WebSocket(openaiUrl, {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1', // importante en algunas cuentas
+        'OpenAI-Beta': 'realtime=v1',
       },
     });
 
-    // ——— Al abrir, configuramos la sesión con el formato correcto:
+    /** Al abrir el WS con OpenAI, configuramos la sesión */
     openaiWs.on('open', () => {
       console.log('OpenAI WS abierto');
 
-      // ---- Configurar la sesión Realtime (OpenAI)
-const sessionUpdate = {
-  type: 'session.update',
-  session: {
-    // Prompt del sistema (tu persona y reglas)
-    instructions: SYSTEM_PROMPT,
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          instructions: SYSTEM_PROMPT,
+          // VAD del lado del servidor (cierra el turno automáticamente)
+          turn_detection: {
+            type: 'server_vad',
+            prefix_padding_ms: 150,
+            silence_duration_ms: 400
+          },
+          // Formatos compatibles con Twilio (μ-law 8kHz mono)
+          input_audio_format:  { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
+          output_audio_format: { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
+          voice: OPENAI_VOICE
+        }
+      };
 
-    // Cierre de turno automático del lado del servidor
-    turn_detection: {
-      type: 'server_vad',
-      prefix_padding_ms: 150,
-      silence_duration_ms: 400,
-    },
+      // Enviamos la configuración: desde ya aceptamos audio
+      openaiWs.send(JSON.stringify(sessionUpdate));
+      openaiReady = true;
+    });
 
-    // ⚠️ Formatos compatibles con Twilio (8 kHz μ-law)
-    input_audio_format:  { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
-    output_audio_format: { type: 'mulaw', sample_rate_hz: 8000, channels: 1 },
+    /** Mensajes de OpenAI -> hacia Twilio */
+    openaiWs.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
 
-    // ⚠️ Voz segura universal
-    voice: 'alloy',
-  },
-};
+      if (msg.type === 'error') {
+        console.error('[OpenAI ERROR]', JSON.stringify(msg, null, 2));
+        return;
+      }
 
-// Enviar la actualización de sesión cuando el WS abra
-openaiWs.on('open', () => {
-  console.log('OpenAI WS abierto');
-  setTimeout(() => {
-    openaiWs.send(JSON.stringify(sessionUpdate));
-  }, 50);
-});
+      // Opcional: log de eventos (oculta los deltas de audio para no saturar)
+      if (msg.type && msg.type !== 'response.output_audio.delta') {
+        console.log('[OpenAI]', msg.type);
+      }
 
-   // ── Mensajes desde OpenAI → los reenviamos a Twilio
-openaiWs.on('message', (raw) => {
-  let msg;
-  try { msg = JSON.parse(raw); } catch { return; }
+      // Cuando el VAD detecta que el usuario dejó de hablar, pedimos respuesta
+      if (msg.type === 'input_audio_buffer.speech_stopped') {
+        openaiWs.send(JSON.stringify({
+          type: 'response.create',
+          response: { modalities: ['audio'], temperature: TEMPERATURE }
+        }));
+      }
 
-  // Log de error detallado (muy importante para depurar)
-  if (msg.type === 'error') {
-    console.error('[OpenAI ERROR]', JSON.stringify(msg, null, 2));
-    return;
-  }
-
-  // Logea tipos (menos los deltas para no saturar)
-  if (msg.type && msg.type !== 'response.output_audio.delta') {
-    console.log('[OpenAI]', msg.type);
-  }
-
-  // Audio de salida (μ-law base64) → a Twilio Media Streams
-  if (msg.type === 'response.output_audio.delta' && msg.delta && streamSid) {
-    twilioConn.send(JSON.stringify({
-      event: 'media',
-      streamSid,
-      media: { payload: msg.delta }  // base64 μ-law
-    }));
-  }
-
-  // (Opcional) fin de respuesta
-  if (msg.type === 'response.done') {
-    // Puedes marcar fin si usas marks
-    // twilioConn.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai_end' } }));
-  }
-});
+      // Audio de salida μ-law (base64) hacia Twilio
+      if (msg.type === 'response.output_audio.delta' && msg.delta && streamSid) {
+        twilioConn.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: msg.delta }
+        }));
+      }
+    });
 
     openaiWs.on('error', (e) => {
       console.error('OpenAI WS error:', e?.message || e);
@@ -140,44 +128,46 @@ openaiWs.on('message', (raw) => {
       try { twilioConn.close(); } catch {}
     });
 
-    // ——— Mensajes desde Twilio -> los reenviamos a OpenAI
+    /** Mensajes de Twilio -> hacia OpenAI */
     twilioConn.on('message', (raw) => {
       let data;
       try { data = JSON.parse(raw); } catch { return; }
 
       switch (data.event) {
-        case 'start':
+        case 'start': {
           streamSid = data.start?.streamSid;
           console.log('Twilio stream start', streamSid);
           break;
-
-        case 'media':
-          // Asegurarse de NO enviar nada hasta que OpenAI esté listo.
+        }
+        case 'media': {
+          // Frames μ-law 8kHz en base64 (≈20ms). No envíes si aún no configuraste sesión.
           if (!openaiReady) return;
 
-          // Twilio envía audio μ-law 8 kHz en base64 (20 ms por frame).
           openaiWs.send(JSON.stringify({
             type: 'input_audio_buffer.append',
-            audio: data.media.payload   // base64 μ-law
+            audio: data.media.payload
           }));
-          break;
 
-        case 'mark':
-          // No hacemos nada especial; solo drena la cola de marks.
+          // Con server_vad NO enviamos commit manual; el servidor lo hace al detectar silencio.
           break;
-
-        case 'stop':
+        }
+        case 'mark': {
+          // opcional: manejar marks si los usas
+          break;
+        }
+        case 'stop': {
           console.log('Twilio stream stop');
           try { openaiWs.close(); } catch {}
           break;
-
-        default:
-          // Otros eventos informativos
+        }
+        default: {
+          // otros eventos informativos
           break;
+        }
       }
     });
 
-    // Cierre del lado Twilio
+    /** Cierre del WS de Twilio */
     twilioConn.on('close', () => {
       console.log('Twilio WS cerrado');
       try { openaiWs.close(); } catch {}
@@ -185,6 +175,7 @@ openaiWs.on('message', (raw) => {
   });
 });
 
+/** Arranque HTTP (Render requiere 0.0.0.0 y PORT) */
 fastify.listen({ port: PORT, host: '0.0.0.0' })
   .then(() => console.log(`🚀 Servicio escuchando en 0.0.0.0:${PORT}`))
   .catch((err) => {
